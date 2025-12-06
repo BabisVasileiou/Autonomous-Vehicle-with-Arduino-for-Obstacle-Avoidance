@@ -21,17 +21,26 @@ const int IN2 = 16; // A2
 const int IN3 = 15; // A1
 const int IN4 = 14; // A0
 
-// Cliff Sensor Pins (Corrected based on Wiring Doc: 2=Right, 3=Left)
+// --- NEW ADDITION FOR SPEED CONTROL ---
+// Remove jumpers from L298N and connect ENA/ENB pins
+const int ENA = 5;  // PWM Pin for Motor A speed
+const int ENB = 6;  // PWM Pin for Motor B speed
+
+// Set Robot Speed (0-255)
+// Try 120 for slow/safe speed, 150 for medium, 255 for max.
+const int ROBOT_SPEED = 120; 
+// --------------------------------------
+
+// Cliff Sensor Pins
 const int CLIFF_LEFT_PIN = 3; 
 const int CLIFF_RIGHT_PIN = 2;
 
 // LOGIC CONFIGURATION
 // Set true if sensors output LOW when detecting floor (Common IR modules)
-// This enables INPUT_PULLUP for safety (Wire break = HIGH = Cliff)
 const bool CLIFF_ACTIVE_LOW = true;
 
-// LCD Address (Usually 0x27 or 0x3F)
-const int LCD_ADDRESS = 0x27;
+// LCD Address (Change to 0x3F if 0x27 doesn't work)
+const int LCD_ADDRESS = 0x27; 
 
 // ==========================================
 // 2. CLASS: DASHBOARD (LCD MANAGER)
@@ -105,7 +114,7 @@ class Sonar {
       digitalWrite(trigPin, LOW);
 
       // Timeout 25ms (~4.3m max range)
-      long duration = pulseIn(echoPin, HIGH, 25000L);
+      long duration = pulseIn(echoPin, HIGH, 25000L); 
 
       float rawDist;
       if (duration == 0) {
@@ -123,32 +132,46 @@ class Sonar {
         kalmanEstimate = kalmanEstimate + kalmanGain * (rawDist - kalmanEstimate);
         err_estimate = (1.0f - kalmanGain) * err_estimate + q;
       }
-
       return kalmanEstimate;
     }
 };
 
 // ==========================================
-// 4. CLASS: MOTOR ABSTRACTION LAYER
+// 4. CLASS: MOTOR ABSTRACTION LAYER (UPDATED)
 // ==========================================
 enum MoveState { HALT, FWD, REV, TRN_L, TRN_R };
 
 class DriveTrain {
   private:
     int p1, p2, p3, p4;
+    int enA, enB; // Speed control pins
+    int speed;    // Current speed value
 
   public:
-    DriveTrain(int in1, int in2, int in3, int in4) {
+    // Updated Constructor to accept ENA/ENB pins
+    DriveTrain(int in1, int in2, int in3, int in4, int ea, int eb) {
       p1 = in1; p2 = in2; p3 = in3; p4 = in4;
+      enA = ea; enB = eb;
+      speed = ROBOT_SPEED;
     }
 
     void begin() {
       pinMode(p1, OUTPUT); pinMode(p2, OUTPUT);
       pinMode(p3, OUTPUT); pinMode(p4, OUTPUT);
+      pinMode(enA, OUTPUT); pinMode(enB, OUTPUT); // Configure PWM pins
       set(HALT);
     }
 
     void set(MoveState state) {
+      // Apply Speed Control
+      if (state != HALT) {
+        analogWrite(enA, speed);
+        analogWrite(enB, speed);
+      } else {
+        analogWrite(enA, 0);
+        analogWrite(enB, 0);
+      }
+
       switch (state) {
         case FWD:   writeMotors(LOW, HIGH, LOW, HIGH); break;
         case REV:   writeMotors(HIGH, LOW, HIGH, LOW); break;
@@ -201,8 +224,8 @@ class RobotBrain {
     const unsigned long SERVO_DELAY = 200;
     const unsigned long ESCAPE_TIME = 600;
     const unsigned long CLIFF_TIME = 700;
-    const int SERVO_LEFT_LIM = 150;  // Limit servo sweep
-    const int SERVO_RIGHT_LIM = 30; 
+    const int SERVO_LEFT_LIM = 150;
+    const int SERVO_RIGHT_LIM = 30;
 
   public:
     RobotBrain(Sonar* s, DriveTrain* m, Dashboard* d) {
@@ -362,9 +385,9 @@ class RobotBrain {
 
       // Adaptive turn time calculation
       consecutiveTurns++;
-      float diff = fabs(distLeft - distRight); 
+      float diff = fabs(distLeft - distRight);
       float ratio = constrain(diff / 100.0f, 0.0f, 1.0f);
-      int adaptiveTime = (int) round(250.0f + ratio * (600.0f - 250.0f));
+      int adaptiveTime = (int)round(250.0f + ratio * (600.0f - 250.0f));
       adaptiveTime = constrain(adaptiveTime, 200, 1200);
 
       if (distLeft > distRight) {
@@ -387,7 +410,10 @@ class RobotBrain {
 // 6. GLOBAL INSTANCES & MAIN LOOP
 // ==========================================
 Sonar mySonar(TRIG_PIN, ECHO_PIN);
-DriveTrain myMotors(IN1, IN2, IN3, IN4);
+
+// Pass Motor Pins AND Speed Control Pins (ENA, ENB)
+DriveTrain myMotors(IN1, IN2, IN3, IN4, ENA, ENB);
+
 Dashboard myScreen;
 RobotBrain myRobot(&mySonar, &myMotors, &myScreen);
 
@@ -402,7 +428,7 @@ void setup() {
   myMotors.begin();
   myRobot.begin();
 
-  Serial.println("System Ready: Eng-Grade v3.3 (Corrected Pins)");
+  Serial.println("System Ready: FULL VERSION (Speed Control Active)");
 }
 
 void loop() {
