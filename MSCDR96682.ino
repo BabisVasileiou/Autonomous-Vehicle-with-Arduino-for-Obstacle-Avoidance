@@ -1,0 +1,355 @@
+/*
+ * University of West Attica - MSc DRONES
+ * Autonomous Vehicle with Arduino for Obstacle Avoidance
+ */
+
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ==========================================
+// 1. CONFIGURATION & CONSTANTS
+// ==========================================
+const float SOUND_SPEED = 0.0343f; // cm/us
+const int SERVO_PIN = 11;
+const int ECHO_PIN = 9;
+const int TRIG_PIN = 8;
+
+// Motor Pins
+const int IN1 = 17; // A3
+const int IN2 = 16; // A2
+const int IN3 = 15; // A1
+const int IN4 = 14; // A0
+const int ENA = 5;  // PWM Motor A
+const int ENB = 6;  // PWM Motor B
+
+const int ROBOT_SPEED = 120; 
+
+// --- SENSORS ---
+// 1. Cliff Sensors (Bottom) - Priority 1 (Safety)
+const int CLIFF_LEFT_PIN = 3; 
+const int CLIFF_RIGHT_PIN = 2;
+
+// 2. Obstacle Sensors (Front) - Priority 2 (Blind Spot Coverage)
+const int IR_OBS_LEFT_PIN = 7;
+const int IR_OBS_RIGHT_PIN = 4;
+
+// Logic: Set true if sensors output LOW when detecting obstacle/floor
+const bool CLIFF_ACTIVE_LOW = true;     // LOW = Floor present
+const bool OBSTACLE_ACTIVE_LOW = true;  // LOW = Obstacle detected
+
+const int LCD_ADDRESS = 0x27;
+
+// ==========================================
+// 2. CLASS: DASHBOARD
+// ==========================================
+class Dashboard {
+  private:
+    LiquidCrystal_I2C lcd;
+    String lastLine1, lastLine2;
+
+  public:
+    Dashboard() : lcd(LCD_ADDRESS, 16, 2) {}
+
+    void begin() {
+      lcd.init();
+      lcd.backlight();
+      show("SYSTEM BOOT", "Sensor Fusion...");
+      delay(300);
+    }
+
+    void show(const String &line1, const String &line2) {
+      if (line1 != lastLine1 || line2 != lastLine2) {
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+        lastLine1 = line1; lastLine2 = line2;
+      }
+    }
+};
+
+// ==========================================
+// 3. CLASS: SONAR (KALMAN)
+// ==========================================
+class Sonar {
+  private:
+    int trigPin, echoPin;
+    float kalmanEstimate, err_measure, err_estimate, q;
+    bool isInitialized;
+
+  public:
+    Sonar(int trig, int echo) {
+      trigPin = trig; echoPin = echo;
+      kalmanEstimate = 0; err_measure = 2.0; err_estimate = 2.0; q = 0.1;
+      isInitialized = false;
+    }
+
+    void begin() {
+      pinMode(trigPin, OUTPUT); pinMode(echoPin, INPUT);
+      digitalWrite(trigPin, LOW);
+    }
+
+    float read() {
+      digitalWrite(trigPin, LOW); delayMicroseconds(2);
+      digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+      digitalWrite(trigPin, LOW);
+      long duration = pulseIn(echoPin, HIGH, 25000L);
+      float rawDist = (duration == 0) ? 250.0f : (duration * SOUND_SPEED) / 2.0f;
+
+      if (!isInitialized) {
+        kalmanEstimate = rawDist; isInitialized = true;
+      } else {
+        float K = err_estimate / (err_estimate + err_measure);
+        kalmanEstimate = kalmanEstimate + K * (rawDist - kalmanEstimate);
+        err_estimate = (1.0f - K) * err_estimate + q;
+      }
+      return kalmanEstimate;
+    }
+};
+
+// ==========================================
+// 4. CLASS: DRIVE TRAIN
+// ==========================================
+enum MoveState { HALT, FWD, REV, TRN_L, TRN_R };
+
+class DriveTrain {
+  private:
+    int p1, p2, p3, p4, enA, enB, speed;
+
+  public:
+    DriveTrain(int in1, int in2, int in3, int in4, int ea, int eb) {
+      p1 = in1; p2 = in2; p3 = in3; p4 = in4; enA = ea; enB = eb;
+      speed = ROBOT_SPEED;
+    }
+
+    void begin() {
+      pinMode(p1, OUTPUT); pinMode(p2, OUTPUT);
+      pinMode(p3, OUTPUT); pinMode(p4, OUTPUT);
+      pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+      set(HALT);
+    }
+
+    void set(MoveState state) {
+      if (state != HALT) {
+        analogWrite(enA, speed); analogWrite(enB, speed);
+      } else {
+        analogWrite(enA, 0); analogWrite(enB, 0);
+      }
+      switch (state) {
+        case FWD:   writeMotors(LOW, HIGH, LOW, HIGH); break;
+        case REV:   writeMotors(HIGH, LOW, HIGH, LOW); break;
+        case TRN_L: writeMotors(LOW, HIGH, HIGH, LOW); break;
+        case TRN_R: writeMotors(HIGH, LOW, LOW, HIGH); break;
+        case HALT:  writeMotors(LOW, LOW, LOW, LOW);   break;
+      }
+    }
+
+  private:
+    void writeMotors(int a, int b, int c, int d) {
+      digitalWrite(p1, a); digitalWrite(p2, b);
+      digitalWrite(p3, c); digitalWrite(p4, d);
+    }
+};
+
+// ==========================================
+// 5. CLASS: ROBOT BRAIN (AI)
+// ==========================================
+enum BrainState {
+  CRUISING, DETECTED_OBSTACLE, SCANNING_LEFT, SCANNING_RIGHT,
+  RESETTING_HEAD, DECIDING_PATH, EXECUTING_TURN, EXECUTING_ESCAPE, CLIFF_ESCAPE
+};
+
+class RobotBrain {
+  private:
+    Sonar* sonar;
+    DriveTrain* motors;
+    Dashboard* screen;
+    Servo headServo;
+    BrainState currentState;
+    unsigned long timer, actionDuration, antiLoopTimer;
+    float distCurrent, distLeft, distRight;
+    int consecutiveTurns;
+
+    // Tuning
+    const float SAFE_DIST = 25.0f;
+    const float CRIT_DIST = 10.0f;
+    const unsigned long SERVO_DELAY = 250; 
+    const int SERVO_LEFT_LIM = 150;
+    const int SERVO_RIGHT_LIM = 30;
+
+  public:
+    RobotBrain(Sonar* s, DriveTrain* m, Dashboard* d) {
+      sonar = s; motors = m; screen = d;
+      currentState = CRUISING; consecutiveTurns = 0;
+      distCurrent = 250.0f;
+    }
+
+    void begin() {
+      // Setup Sensor Pins
+      pinMode(CLIFF_LEFT_PIN, CLIFF_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+      pinMode(CLIFF_RIGHT_PIN, CLIFF_ACTIVE_LOW ? INPUT_PULLUP : INPUT);
+      
+      // New Obstacle Sensors (No Pullup usually needed for modules, but safe to use)
+      pinMode(IR_OBS_LEFT_PIN, INPUT); 
+      pinMode(IR_OBS_RIGHT_PIN, INPUT);
+
+      headServo.attach(SERVO_PIN);
+      headServo.write(90);
+      antiLoopTimer = millis();
+      delay(200);
+    }
+
+    void update() {
+      // --- PRIORITY 1: CLIFF SAFETY (DROP DETECTION) ---
+      bool cliffL = (digitalRead(CLIFF_LEFT_PIN) == HIGH); // HIGH = Cliff/Air
+      bool cliffR = (digitalRead(CLIFF_RIGHT_PIN) == HIGH);
+      
+      if ((cliffL || cliffR) && currentState != CLIFF_ESCAPE) {
+        motors->set(REV);
+        screen->show("! DANGER !", "CLIFF DETECTED");
+        transitionTo(CLIFF_ESCAPE, 700);
+        return;
+      }
+
+      // --- PRIORITY 2: OBSTACLE SENSORS (CLOSE PROXIMITY) ---
+      // Low usually means obstacle detected for IR modules
+      bool obsL = (digitalRead(IR_OBS_LEFT_PIN) == (OBSTACLE_ACTIVE_LOW ? LOW : HIGH));
+      bool obsR = (digitalRead(IR_OBS_RIGHT_PIN) == (OBSTACLE_ACTIVE_LOW ? LOW : HIGH));
+
+      // FSM Logic
+      switch (currentState) {
+        case CRUISING:
+          distCurrent = sonar->read();
+          
+          // Check IR Sensors (Blind spot coverage) OR Sonar Panic
+          if (obsL || obsR || distCurrent < CRIT_DIST) {
+            motors->set(REV); // Panic Reverse
+            screen->show("OBSTACLE!", obsL ? "Left IR" : (obsR ? "Right IR" : "Sonar Close"));
+            transitionTo(EXECUTING_ESCAPE, 500);
+          } 
+          else if (distCurrent < SAFE_DIST) {
+            motors->set(HALT);
+            transitionTo(DETECTED_OBSTACLE, 100);
+          } 
+          else {
+            motors->set(FWD);
+            screen->show("CRUISING", "Path Clear");
+            // Anti-loop reset
+            if (millis() - antiLoopTimer >= 2000UL) {
+              consecutiveTurns = 0;
+              antiLoopTimer = millis();
+            }
+          }
+          break;
+
+        case DETECTED_OBSTACLE:
+          screen->show("SCANNING", "Please Wait...");
+          headServo.write(SERVO_LEFT_LIM);
+          transitionTo(SCANNING_LEFT, SERVO_DELAY);
+          break;
+
+        case SCANNING_LEFT:
+          if (timerExpired()) {
+            distLeft = sonar->read();
+            headServo.write(SERVO_RIGHT_LIM);
+            transitionTo(SCANNING_RIGHT, SERVO_DELAY);
+          }
+          break;
+
+        case SCANNING_RIGHT:
+          if (timerExpired()) {
+            distRight = sonar->read();
+            headServo.write(90);
+            transitionTo(RESETTING_HEAD, SERVO_DELAY);
+          }
+          break;
+
+        case RESETTING_HEAD:
+          if (timerExpired()) currentState = DECIDING_PATH;
+          break;
+
+        case DECIDING_PATH:
+          makeDecision();
+          break;
+
+        case EXECUTING_TURN:
+          if (timerExpired()) {
+            motors->set(HALT);
+            transitionTo(CRUISING, 100);
+          }
+          break;
+
+        case EXECUTING_ESCAPE: // Post-reverse logic
+          if (timerExpired()) {
+            motors->set(HALT);
+            transitionTo(DETECTED_OBSTACLE, 100); // Stop & Scan after reverse
+          }
+          break;
+
+        case CLIFF_ESCAPE:
+          if (timerExpired()) {
+            motors->set(TRN_L); // Spin away
+            transitionTo(EXECUTING_TURN, 800);
+          }
+          break;
+      }
+    }
+
+  private:
+    void transitionTo(BrainState next, unsigned long ms) {
+      currentState = next; timer = millis(); actionDuration = ms;
+    }
+    bool timerExpired() { return (millis() - timer >= actionDuration); }
+
+    void makeDecision() {
+      // Anti-loop
+      if (consecutiveTurns >= 3) {
+        motors->set(TRN_L);
+        screen->show("DECISION", "U-Turn (Loop)");
+        transitionTo(EXECUTING_TURN, 900);
+        consecutiveTurns = 0;
+        return;
+      }
+      
+      // Dead End
+      if (distLeft < SAFE_DIST && distRight < SAFE_DIST) {
+        motors->set(REV);
+        screen->show("DECISION", "Dead End");
+        transitionTo(EXECUTING_ESCAPE, 400);
+        return;
+      }
+
+      // Adaptive Turn
+      consecutiveTurns++;
+      float diff = abs(distLeft - distRight);
+      int t = constrain(map(diff, 0, 100, 250, 600), 250, 800);
+      
+      if (distLeft > distRight) {
+        motors->set(TRN_L); screen->show("DECISION", "Left");
+      } else {
+        motors->set(TRN_R); screen->show("DECISION", "Right");
+      }
+      transitionTo(EXECUTING_TURN, t);
+    }
+};
+
+// ==========================================
+// 6. GLOBAL INSTANCES & MAIN
+// ==========================================
+Sonar mySonar(TRIG_PIN, ECHO_PIN);
+DriveTrain myMotors(IN1, IN2, IN3, IN4, ENA, ENB);
+Dashboard myScreen;
+RobotBrain myRobot(&mySonar, &myMotors, &myScreen);
+
+void setup() {
+  Wire.begin();
+  myScreen.begin();
+  mySonar.begin();
+  myMotors.begin();
+  myRobot.begin();
+}
+
+void loop() {
+  myRobot.update();
+  delay(1);
+}
